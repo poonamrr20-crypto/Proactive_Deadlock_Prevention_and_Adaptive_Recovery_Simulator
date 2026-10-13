@@ -126,4 +126,8 @@ public class LockOrderGraph {
     return adjacencyList.containsKey(from)
             && adjacencyList.get(from).contains(to);
 }
+
+    public void clear() {
+        adjacencyList.clear();
+    }
 }

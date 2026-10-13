@@ -109,6 +109,38 @@ public void clear() {
         return false;
     }
 
+    public Set<String> getCycleNodes() {
+        Set<String> visited = new LinkedHashSet<>();
+        Set<String> path = new LinkedHashSet<>();
+        for (String processId : adjacencyList.keySet()) {
+            Set<String> cycle = findCycle(processId, visited, path);
+            if (!cycle.isEmpty()) {
+                return cycle;
+            }
+        }
+        return Collections.emptySet();
+    }
+
+    private Set<String> findCycle(String current, Set<String> visited,
+            Set<String> path) {
+        if (path.contains(current)) {
+            return new LinkedHashSet<>(path);
+        }
+        if (visited.contains(current)) {
+            return Collections.emptySet();
+        }
+        visited.add(current);
+        path.add(current);
+        for (String neighbor : adjacencyList.get(current)) {
+            Set<String> cycle = findCycle(neighbor, visited, path);
+            if (!cycle.isEmpty()) {
+                return cycle;
+            }
+        }
+        path.remove(current);
+        return Collections.emptySet();
+    }
+
     /**
      * DFS detects a cycle by checking whether a node is
      * already in the current recursion path.

@@ -202,6 +202,61 @@ public void clearWaitingRequest(String processId) {
     }
 }
 
+    public Map<String, Integer> getHeldResources(String processId) {
+        Map<String, Integer> held = allocations.get(processId);
+        if (held == null) {
+            return Collections.emptyMap();
+        }
+        return Collections.unmodifiableMap(new LinkedHashMap<>(held));
+    }
+
+    public int releaseAllResources(String processId) {
+        if (!processes.containsKey(processId)) {
+            return 0;
+        }
+        int released = 0;
+        Map<String, Integer> held = allocations.get(processId);
+        for (Map.Entry<String, Integer> entry
+                : new LinkedHashMap<>(held).entrySet()) {
+            Resource resource = resources.get(entry.getKey());
+            if (resource != null) {
+                for (int i = 0; i < entry.getValue(); i++) {
+                    resource.releaseInstance();
+                    released++;
+                }
+            }
+        }
+        held.clear();
+        clearWaitingRequest(processId);
+        return released;
+    }
+
+    public boolean terminateProcess(String processId) {
+        Process process = processes.get(processId);
+        if (process == null) {
+            return false;
+        }
+        releaseAllResources(processId);
+        process.setState(Process.State.TERMINATED);
+        return true;
+    }
+
+    public int getTotalAllocatedCount(String processId) {
+        int total = 0;
+        for (int count : allocations.getOrDefault(
+                processId, Collections.emptyMap()).values()) {
+            total += count;
+        }
+        return total;
+    }
+
+    public void clear() {
+        processes.clear();
+        resources.clear();
+        allocations.clear();
+        waitingRequests.clear();
+    }
+
     /**
      * Returns a read-only view of the allocation records.
      */
