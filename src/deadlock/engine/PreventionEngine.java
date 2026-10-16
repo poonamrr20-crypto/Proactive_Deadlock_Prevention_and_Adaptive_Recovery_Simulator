@@ -279,6 +279,11 @@ private void rebuildWaitForGraph() {
     }
 }
 
+/** Refreshes graph dependencies after an external recovery action. */
+public void refreshWaitForGraph() {
+    rebuildWaitForGraph();
+}
+
 /**
  * Releases one resource instance and reconsiders waiting processes.
  */

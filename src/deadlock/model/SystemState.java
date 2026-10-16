@@ -250,6 +250,39 @@ public void clearWaitingRequest(String processId) {
         return total;
     }
 
+    /** Creates an independent copy suitable for hypothetical recovery. */
+    public SystemState copy() {
+        SystemState copy = new SystemState();
+        for (Process process : processes.values()) {
+            Process processCopy = new Process(process.getProcessId(),
+                    process.getPriority());
+            processCopy.setExecutionProgress(process.getExecutionProgress());
+            processCopy.setState(process.getState());
+            copy.addProcess(processCopy);
+        }
+        for (Resource resource : resources.values()) {
+            copy.addResource(new Resource(resource.getResourceId(),
+                    resource.getTotalInstances(), resource.isPreemptible()));
+        }
+        for (Map.Entry<String, Map<String, Integer>> processEntry
+                : allocations.entrySet()) {
+            for (Map.Entry<String, Integer> resourceEntry
+                    : processEntry.getValue().entrySet()) {
+                for (int i = 0; i < resourceEntry.getValue(); i++) {
+                    if (!copy.allocateResource(processEntry.getKey(),
+                            resourceEntry.getKey())) {
+                        throw new IllegalStateException(
+                                "Unable to copy resource allocation.");
+                    }
+                }
+            }
+        }
+        for (Map.Entry<String, String> waiting : waitingRequests.entrySet()) {
+            copy.setWaitingRequest(waiting.getKey(), waiting.getValue());
+        }
+        return copy;
+    }
+
     public void clear() {
         processes.clear();
         resources.clear();

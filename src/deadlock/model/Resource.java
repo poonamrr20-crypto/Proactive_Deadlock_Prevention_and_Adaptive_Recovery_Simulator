@@ -8,9 +8,14 @@ public class Resource {
 
     private final String resourceId;
     private final int totalInstances;
+    private final boolean preemptible;
     private int availableInstances;
 
     public Resource(String resourceId, int totalInstances) {
+        this(resourceId, totalInstances, false);
+    }
+
+    public Resource(String resourceId, int totalInstances, boolean preemptible) {
         if (resourceId == null || resourceId.isBlank()) {
             throw new IllegalArgumentException(
                 "Resource ID cannot be empty."
@@ -25,6 +30,7 @@ public class Resource {
 
         this.resourceId = resourceId;
         this.totalInstances = totalInstances;
+        this.preemptible = preemptible;
         this.availableInstances = totalInstances;
     }
 
@@ -38,6 +44,10 @@ public class Resource {
 
     public int getAvailableInstances() {
         return availableInstances;
+    }
+
+    public boolean isPreemptible() {
+        return preemptible;
     }
 
     public boolean hasAvailableInstance() {
