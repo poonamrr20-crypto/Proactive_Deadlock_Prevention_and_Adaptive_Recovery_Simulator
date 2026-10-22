@@ -5,6 +5,7 @@ import deadlock.model.Process;
 import deadlock.model.Resource;
 import deadlock.model.SystemState;
 
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
@@ -23,7 +24,12 @@ public final class RecoveryPlanEvaluator {
     }
 
     public RecoveryPlanResult evaluate(RecoveryPlan plan, SystemState original) {
-        return execute(plan, original.copy(), false);
+        try {
+            return execute(plan, original.copy(), false);
+        } catch (RuntimeException failure) {
+            return invalid(plan, failure.getMessage() == null
+                    ? "Candidate simulation failed." : failure.getMessage());
+        }
     }
 
     public RecoveryPlanResult execute(RecoveryPlan plan, SystemState state) {
@@ -33,11 +39,14 @@ public final class RecoveryPlanEvaluator {
     private RecoveryPlanResult execute(RecoveryPlan plan, SystemState state,
             boolean actual) {
         WaitForGraph graph = buildWaitForGraph(state);
+        Set<String> cycleProcesses = graph.getCycleNodes();
         Set<String> initiallyBlocked = blockedProcesses(state);
         int terminated = 0;
+        int rollbackActions = 0;
         int released = 0;
         double lostWork = 0.0;
-        double cost = 0.0;
+        double priorityImpact = 0.0;
+        double affectedWork = 0.0;
 
         for (RecoveryAction action : plan.getActions()) {
             Process process = state.getProcess(action.getProcessId());
@@ -46,31 +55,44 @@ public final class RecoveryPlanEvaluator {
             }
             switch (action.getType()) {
                 case TERMINATE:
-                    lostWork += process.getExecutionProgress();
+                lostWork += process.getCompletedWork();
+                affectedWork += process.getTotalWork();
+                priorityImpact += process.getCompletedWork()
+                    * priorityMultiplier(process);
                     released += state.releaseAllResources(action.getProcessId());
                     process.setState(Process.State.TERMINATED);
+                process.incrementRecoveryVictimCount();
                     terminated++;
-                    cost += weights.getPriority() * process.getPriority()
-                            + weights.getTerminationPenalty();
                     break;
                 case ROLLBACK:
-                    double progressBeforeRollback = process.getExecutionProgress();
+                double workBeforeRollback = process.getCompletedWork();
                     double checkpointProgress = checkpoints.getProgress(
                             action.getProcessId(), action.getCheckpointId());
                     if (!checkpoints.restore(action.getProcessId(),
                             action.getCheckpointId(), state)) {
                         return invalid(plan, "Checkpoint cannot be restored safely.");
                     }
-                    cost += weights.getRollbackOverhead();
-                    lostWork += Math.max(0.0, progressBeforeRollback - checkpointProgress);
+                lostWork += Math.max(0.0, workBeforeRollback
+                    - process.getTotalWork() * checkpointProgress / 100.0);
+                affectedWork += process.getTotalWork();
+                priorityImpact += Math.max(0.0, workBeforeRollback
+                    - process.getTotalWork() * checkpointProgress / 100.0)
+                    * priorityMultiplier(process);
+                rollbackActions++;
+                    process.incrementRecoveryVictimCount();
                     break;
                 case PREEMPT:
                     if (!canPreemptSafely(state, action.getProcessId(),
                             action.getResourceId())) {
                         return invalid(plan, "Resource cannot be safely preempted.");
                     }
-                    if (action.isRestartAfterPreemption()) {
-                        lostWork += process.getExecutionProgress();
+                    if (action.isRestartAfterPreemption()
+                            || weights.getPreemptionMode()
+                                == RecoveryCostWeights.PreemptionMode.RESTART) {
+                        double workBeforeRestart = process.getCompletedWork();
+                        lostWork += workBeforeRestart;
+                        affectedWork += process.getTotalWork();
+                        priorityImpact += workBeforeRestart * priorityMultiplier(process);
                         process.setExecutionProgress(0.0);
                     }
                     if (!state.releaseResource(action.getProcessId(),
@@ -78,7 +100,9 @@ public final class RecoveryPlanEvaluator {
                         return invalid(plan, "Resource preemption failed.");
                     }
                     released++;
-                    process.setState(Process.State.READY);
+                        process.setState(state.getWaitingRequest(process.getProcessId()) == null
+                            ? Process.State.READY : Process.State.WAITING);
+                    process.incrementRecoveryVictimCount();
                     break;
                 default:
                     return invalid(plan, "Unsupported recovery action.");
@@ -90,22 +114,42 @@ public final class RecoveryPlanEvaluator {
         Set<String> remainingBlocked = blockedProcesses(state);
         int unblocked = initiallyBlocked.size() - remainingBlocked.size();
         boolean resolved = !graph.hasCycle();
-        cost += weights.getLostWork() * lostWork
-                + weights.getReclaimedResource() * released
-                + weights.getStarvationRisk() * repeatedVictims(plan);
-        if (!resolved) {
-            cost += 1000.0;
+        boolean success = resolved
+            && (unblocked > 0 || terminated >= cycleProcesses.size());
+        double totalResources = 0.0;
+        for (Resource resource : state.getAllResources()) {
+            totalResources += resource.getTotalInstances();
         }
+        double lostWorkCost = clamp(affectedWork == 0.0 ? 0.0 : lostWork / affectedWork);
+        double priorityCost = clamp(affectedWork == 0.0 ? 0.0
+            : priorityImpact / (affectedWork * weights.getMaximumPriorityMultiplier()));
+        double terminationCost = clamp(cycleProcesses.isEmpty() ? 0.0
+            : (double) terminated / cycleProcesses.size());
+        double rollbackCost = clamp((double) rollbackActions
+            / Math.max(1, cycleProcesses.size()));
+        double starvationCost = clamp(starvationCost(plan));
+        double resourceBenefit = clamp(totalResources == 0.0 ? 0.0
+            : released / totalResources);
+        double cost = weights.getLostWork() * lostWorkCost
+            + weights.getPriority() * priorityCost
+            + weights.getTerminationPenalty() * terminationCost
+            + weights.getRollbackOverhead() * rollbackCost
+            + weights.getStarvationRisk() * starvationCost
+            + (success ? 0.0 : weights.getUnresolvedDeadlock())
+            - weights.getResourceBenefit() * resourceBenefit;
+        cost = Math.max(0.0, cost);
         if (actual) {
             for (RecoveryAction action : plan.getActions()) {
-                if (action.getType() == RecoveryAction.Type.TERMINATE) {
+                if (action.getType() == RecoveryAction.Type.TERMINATE
+                    || action.getType() == RecoveryAction.Type.PREEMPT
+                    || action.getType() == RecoveryAction.Type.ROLLBACK) {
                     victimCounts.merge(action.getProcessId(), 1, Integer::sum);
                 }
             }
         }
-        return new RecoveryPlanResult(plan, true, resolved, unblocked,
+        return new RecoveryPlanResult(plan, true, success, unblocked,
             terminated, released, lostWork, resourceUtilization(state), cost,
-                resolved ? "Plan executed successfully." : "Plan left a deadlock.");
+            success ? "Plan executed successfully." : "Plan left a deadlock.");
     }
 
     public boolean canPreemptSafely(SystemState state, String processId,
@@ -119,12 +163,21 @@ public final class RecoveryPlanEvaluator {
                 && state.getAllocatedCount(processId, resourceId) > 0;
     }
 
-    private int repeatedVictims(RecoveryPlan plan) {
-        int count = 0;
+    private double starvationCost(RecoveryPlan plan) {
+        double cost = 0.0;
         for (RecoveryAction action : plan.getActions()) {
-            count += victimCounts.getOrDefault(action.getProcessId(), 0);
+            cost = Math.max(cost, (double) victimCounts.getOrDefault(
+                    action.getProcessId(), 0) / weights.getStarvationThreshold());
         }
-        return count;
+        return cost;
+    }
+
+    private double priorityMultiplier(Process process) {
+        return weights.getPriorityMultiplier(process.getPriority());
+    }
+
+    private static double clamp(double value) {
+        return Math.max(0.0, Math.min(1.0, value));
     }
 
     private RecoveryPlanResult invalid(RecoveryPlan plan, String message) {
@@ -177,6 +230,10 @@ public final class RecoveryPlanEvaluator {
         for (Process waiting : state.getAllProcesses()) {
             String requested = state.getWaitingRequest(waiting.getProcessId());
             if (requested == null) {
+                continue;
+            }
+            Resource requestedResource = state.getResource(requested);
+            if (requestedResource == null || requestedResource.hasAvailableInstance()) {
                 continue;
             }
             for (Process holder : state.getAllProcesses()) {

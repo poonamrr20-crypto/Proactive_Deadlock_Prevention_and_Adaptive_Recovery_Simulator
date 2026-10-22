@@ -44,6 +44,7 @@ public class SystemState {
 
         processes.put(id, process);
         allocations.put(id, new LinkedHashMap<>());
+        process.setTerminationHandler(() -> releaseAllResources(id));
     }
 
     public void addResource(Resource resource) {
@@ -85,6 +86,19 @@ public class SystemState {
     }
 
     /**
+     * Returns whether the state contains a resource type with multiple
+     * interchangeable instances.
+     */
+    public boolean hasMultiInstanceResource() {
+        for (Resource resource : resources.values()) {
+            if (resource.getTotalInstances() > 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Returns the number of instances of a resource
      * held by a process.
      */
@@ -112,6 +126,10 @@ public class SystemState {
         Resource resource = resources.get(resourceId);
 
         if (process == null || resource == null) {
+            return false;
+        }
+
+        if (process.getState() == Process.State.TERMINATED) {
             return false;
         }
 
@@ -145,6 +163,10 @@ process.setState(Process.State.RUNNING);
             return false;
         }
 
+        if (process.getState() == Process.State.TERMINATED) {
+            return false;
+        }
+
         Map<String, Integer> held = allocations.get(processId);
         int count = held.getOrDefault(resourceId, 0);
 
@@ -169,7 +191,8 @@ process.setState(Process.State.RUNNING);
             String processId, String resourceId) {
 
         if (!processes.containsKey(processId)
-                || !resources.containsKey(resourceId)) {
+                || !resources.containsKey(resourceId)
+                || processes.get(processId).getState() == Process.State.TERMINATED) {
             return false;
         }
 
@@ -258,6 +281,10 @@ public void clearWaitingRequest(String processId) {
                     process.getPriority());
             processCopy.setExecutionProgress(process.getExecutionProgress());
             processCopy.setState(process.getState());
+                while (processCopy.getRecoveryVictimCount()
+                        < process.getRecoveryVictimCount()) {
+                    processCopy.incrementRecoveryVictimCount();
+                }
             copy.addProcess(processCopy);
         }
         for (Resource resource : resources.values()) {

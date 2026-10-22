@@ -20,13 +20,41 @@ public final class RecoveryExperimentRunner {
         private final DeadlockPattern pattern;
         private final int resourceInstances;
         private final int preemptibleEvery;
+        private final RecoveryCostWeights costWeights;
+        private final int minimumPriority;
+        private final int maximumPriority;
+        private final int minimumProgress;
+        private final int maximumProgress;
 
         public WorkloadConfig(int processCount, int resourceCount, int iterations,
                 DeadlockPattern pattern, int resourceInstances,
                 int preemptibleEvery) {
+            this(processCount, resourceCount, iterations, pattern,
+                    resourceInstances, preemptibleEvery, new RecoveryCostWeights(),
+                    1, 4, 0, 100);
+        }
+
+        public WorkloadConfig(int processCount, int resourceCount, int iterations,
+                DeadlockPattern pattern, int resourceInstances,
+                int preemptibleEvery, RecoveryCostWeights costWeights) {
+                this(processCount, resourceCount, iterations, pattern, resourceInstances,
+                    preemptibleEvery, costWeights, 1, 4, 0, 100);
+            }
+
+            public WorkloadConfig(int processCount, int resourceCount, int iterations,
+                DeadlockPattern pattern, int resourceInstances,
+                int preemptibleEvery, RecoveryCostWeights costWeights,
+                int minimumPriority, int maximumPriority,
+                int minimumProgress, int maximumProgress) {
             if (processCount < 2 || resourceCount < 2 || iterations < 1
                     || resourceInstances < 1 || preemptibleEvery < 0
-                    || pattern == null) {
+                    || pattern == null || costWeights == null
+                    || minimumPriority < 1 || maximumPriority > 4
+                    || minimumPriority > maximumPriority
+                    || minimumProgress < 0 || maximumProgress > 100
+                    || minimumProgress > maximumProgress
+                    || (pattern == DeadlockPattern.MULTI_INSTANCE_CYCLE
+                    && resourceInstances < 2)) {
                 throw new IllegalArgumentException("Invalid workload configuration.");
             }
             this.processCount = processCount;
@@ -35,6 +63,11 @@ public final class RecoveryExperimentRunner {
             this.pattern = pattern;
             this.resourceInstances = resourceInstances;
             this.preemptibleEvery = preemptibleEvery;
+            this.costWeights = costWeights.copy();
+            this.minimumPriority = minimumPriority;
+            this.maximumPriority = maximumPriority;
+            this.minimumProgress = minimumProgress;
+            this.maximumProgress = maximumProgress;
         }
 
         public int getProcessCount() { return processCount; }
@@ -43,6 +76,11 @@ public final class RecoveryExperimentRunner {
         public DeadlockPattern getPattern() { return pattern; }
         public int getResourceInstances() { return resourceInstances; }
         public int getPreemptibleEvery() { return preemptibleEvery; }
+        public RecoveryCostWeights getCostWeights() { return costWeights.copy(); }
+        public int getMinimumPriority() { return minimumPriority; }
+        public int getMaximumPriority() { return maximumPriority; }
+        public int getMinimumProgress() { return minimumProgress; }
+        public int getMaximumProgress() { return maximumProgress; }
     }
 
     public static final class ExperimentReport {
@@ -67,6 +105,8 @@ public final class RecoveryExperimentRunner {
     public RecoveryExperimentRunner(long seed) {
         this.seed = seed;
     }
+
+    public long getSeed() { return seed; }
 
     public List<ExperimentReport> run(int processCount, int resourceCount,
             int iterations) {
@@ -110,8 +150,32 @@ public final class RecoveryExperimentRunner {
             int iteration) {
         Random random = new Random(seed + iteration);
         SimulationController controller = new SimulationController();
+        RecoveryCostWeights configuredWeights = configuration.getCostWeights();
+        RecoveryCostWeights targetWeights = controller.getRecoveryCostWeights();
+        targetWeights.setLostWork(configuredWeights.getLostWork());
+        targetWeights.setPriority(configuredWeights.getPriority());
+        targetWeights.setTerminationPenalty(configuredWeights.getTerminationPenalty());
+        targetWeights.setRollbackOverhead(configuredWeights.getRollbackOverhead());
+        targetWeights.setStarvationRisk(configuredWeights.getStarvationRisk());
+        targetWeights.setUnresolvedDeadlock(configuredWeights.getUnresolvedDeadlock());
+        targetWeights.setResourceBenefit(configuredWeights.getResourceBenefit());
+        targetWeights.setStarvationThreshold(configuredWeights.getStarvationThreshold());
+        targetWeights.setCombinationLimit(configuredWeights.getCombinationLimit());
+        targetWeights.setPreemptionMode(configuredWeights.getPreemptionMode());
+        for (int priority = 1; priority <= 4; priority++) {
+            targetWeights.setPriorityMultiplier(priority,
+                configuredWeights.getPriorityMultiplier(priority));
+        }
         for (int i = 1; i <= configuration.getProcessCount(); i++) {
-            controller.addProcess(new Process("P" + i, 1 + random.nextInt(5)));
+            Process process = new Process("P" + i,
+                configuration.getMinimumPriority()
+                    + random.nextInt(configuration.getMaximumPriority()
+                        - configuration.getMinimumPriority() + 1),
+                50.0 + random.nextInt(151));
+            process.setExecutionProgress(configuration.getMinimumProgress()
+                    + random.nextInt(configuration.getMaximumProgress()
+                        - configuration.getMinimumProgress() + 1));
+            controller.addProcess(process);
         }
         for (int i = 1; i <= configuration.getResourceCount(); i++) {
             boolean preemptible = configuration.getPreemptibleEvery() > 0

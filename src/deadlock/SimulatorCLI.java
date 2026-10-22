@@ -5,6 +5,10 @@ import java.util.Scanner;
 import java.util.Collections;
 import java.util.List;
 import java.util.Arrays;
+import java.util.Map;
+import java.io.ByteArrayInputStream;
+import java.io.SequenceInputStream;
+import java.nio.charset.StandardCharsets;
 
 import deadlock.engine.RecoveryExperimentRunner;
 import deadlock.engine.PreventionEngine;
@@ -41,6 +45,15 @@ public class SimulatorCLI {
         System.out.println("==========================================");
 
         try {
+            if (args.length >= 2 && "--custom".equalsIgnoreCase(args[0])) {
+                runCustomScenario(String.join(" ",
+                        Arrays.copyOfRange(args, 1, args.length)));
+                return;
+            }
+            if (args.length >= 2 && "--scenario".equalsIgnoreCase(args[0])) {
+                runScenario(args);
+                return;
+            }
             configureBatchInput(args);
             configureSystem();
             runCommandLoop();
@@ -61,8 +74,208 @@ public class SimulatorCLI {
         }
         String input = String.join(" ", Arrays.copyOfRange(args, 1, args.length));
         String[] entries = input.split("\\s*;\\s*");
-        scanner.close();
-        scanner = new Scanner(String.join(System.lineSeparator(), entries));
+        byte[] scriptedInput = String.join(System.lineSeparator(), entries)
+            .concat(System.lineSeparator()).getBytes(StandardCharsets.UTF_8);
+        scanner = new Scanner(new SequenceInputStream(
+            new ByteArrayInputStream(scriptedInput), System.in));
+    }
+
+    private static void runScenario(String[] args) {
+        String scenario = args[1].toUpperCase();
+        if ("DEADLOCK".equals(scenario)) {
+            controller = new SimulationController();
+            int processCount = scenarioOption(args, "--processes", 2);
+            int resourceCount = scenarioOption(args, "--resources", 2);
+            int instances = scenarioOption(args, "--instances", 1);
+            String preemptibleId = scenarioOption(args, "--preemptible", "R2");
+            String recovery = scenarioOption(args, "--recovery", "ADAPTIVE");
+            if (processCount < 2 || resourceCount < 2 || instances < 1) {
+                throw new IllegalArgumentException(
+                        "DEADLOCK requires at least two processes/resources and one instance.");
+            }
+            for (int i = 1; i <= processCount; i++) {
+                controller.addProcess(new Process("P" + i, i));
+            }
+            for (int i = 1; i <= resourceCount; i++) {
+                String resourceId = "R" + i;
+                controller.addResource(new Resource(resourceId, instances,
+                        resourceId.equalsIgnoreCase(preemptibleId)));
+            }
+            for (int i = 0; i < instances; i++) {
+                controller.getSystemState().allocateResource("P1", "R1");
+                controller.getSystemState().allocateResource("P2", "R2");
+            }
+            controller.getSystemState().setWaitingRequest("P1", "R2");
+            controller.getSystemState().setWaitingRequest("P2", "R1");
+            controller.getWaitForGraph().clear();
+            for (Process process : controller.getSystemState().getAllProcesses()) {
+                controller.getWaitForGraph().addProcess(process.getProcessId());
+            }
+            controller.getWaitForGraph().addEdge("P1", "P2");
+            controller.getWaitForGraph().addEdge("P2", "P1");
+            system = controller.getSystemState();
+            waitForGraph = controller.getWaitForGraph();
+            lockOrderGraph = controller.getLockOrderGraph();
+            engine = controller.getPreventionEngine();
+            System.out.println("\n--- DEADLOCK SCENARIO ---");
+            System.out.println("Input: processes=" + processCount
+                    + " resources=" + resourceCount
+                    + " instances=" + instances
+                    + " preemptible=" + preemptibleId
+                    + " recovery=" + recovery);
+            printFullState();
+            System.out.println("Detected cycle: " + controller.detectDeadlock());
+            RecoveryPlanResult result;
+            if ("ONE".equalsIgnoreCase(recovery)) {
+                result = controller.recoverOneAtATime().get(0);
+            } else if ("ALL".equalsIgnoreCase(recovery)) {
+                result = controller.recoverWithStrategy(
+                        RecoveryPlan.Strategy.TERMINATE_ALL);
+            } else {
+                result = controller.recoverAdaptive();
+            }
+            System.out.println("Recovery result: " + result.getMessage());
+            printMetrics();
+            printFullState();
+            return;
+        }
+        if ("EXPERIMENT".equals(scenario)) {
+            System.out.println("\n--- EXPERIMENT SCENARIO ---");
+            RecoveryExperimentRunner.WorkloadConfig config =
+                    new RecoveryExperimentRunner.WorkloadConfig(4, 4, 2,
+                            RecoveryExperimentRunner.DeadlockPattern.PROCESS_RING,
+                            1, 2);
+                RecoveryExperimentRunner experiment = new RecoveryExperimentRunner(42L);
+                System.out.println("Seed: " + experiment.getSeed());
+                for (RecoveryExperimentRunner.ExperimentReport report
+                    : experiment.run(config)) {
+                RecoveryMetrics metrics = report.getMetrics();
+                System.out.println(report.getPolicy() + " success="
+                        + metrics.getSuccessRate() + " cost="
+                        + metrics.getTotalCost() + " workLost="
+                        + metrics.getTotalWorkLost());
+            }
+            return;
+        }
+        System.out.println("Unknown scenario. Use DEADLOCK or EXPERIMENT.");
+    }
+
+    private static void runCustomScenario(String specification) {
+        Map<String, String> sections = new java.util.LinkedHashMap<>();
+        for (String section : specification.split("\\s*;\\s*")) {
+            int separator = section.indexOf('=');
+            if (separator <= 0) {
+                throw new IllegalArgumentException(
+                        "Each custom section must use key=value.");
+            }
+            sections.put(section.substring(0, separator).trim().toLowerCase(),
+                    section.substring(separator + 1).trim());
+        }
+        controller = new SimulationController();
+        parseCustomProcesses(sections.get("processes"));
+        parseCustomResources(sections.get("resources"));
+        parseCustomAllocations(sections.get("allocations"));
+        parseCustomWaiting(sections.get("waiting"));
+        controller.getPreventionEngine().refreshWaitForGraph();
+        system = controller.getSystemState();
+        waitForGraph = controller.getWaitForGraph();
+        lockOrderGraph = controller.getLockOrderGraph();
+        engine = controller.getPreventionEngine();
+
+        System.out.println("\n--- CUSTOM SCENARIO ---");
+        System.out.println("Input: " + specification);
+        printFullState();
+        List<String> cycle = controller.detectDeadlock();
+        if (cycle.isEmpty()) {
+            System.out.println("DEADLOCK CHECK: no deadlock detected.");
+        } else {
+            System.out.println("DEADLOCK CHECK: DEADLOCK DETECTED: " + cycle);
+            String recovery = sections.getOrDefault("recovery", "NONE");
+            if (!"NONE".equalsIgnoreCase(recovery)) {
+                RecoveryPlanResult result = recoverCustom(recovery);
+                System.out.println("RECOVERY: " + result.getMessage());
+                printMetrics();
+                printFullState();
+            }
+        }
+    }
+
+    private static void parseCustomProcesses(String value) {
+        requireCustomSection(value, "processes");
+        for (String entry : value.split(",")) {
+            String[] fields = entry.trim().split(":");
+            if (fields.length != 2) throw new IllegalArgumentException(
+                    "Process format is processId:priority.");
+            controller.addProcess(new Process(fields[0], Integer.parseInt(fields[1])));
+        }
+    }
+
+    private static void parseCustomResources(String value) {
+        requireCustomSection(value, "resources");
+        for (String entry : value.split(",")) {
+            String[] fields = entry.trim().split(":");
+            if (fields.length != 3) throw new IllegalArgumentException(
+                    "Resource format is resourceId:instances:preemptible.");
+            boolean preemptible = "yes".equalsIgnoreCase(fields[2])
+                    || Boolean.parseBoolean(fields[2]);
+            controller.addResource(new Resource(fields[0],
+                    Integer.parseInt(fields[1]), preemptible));
+        }
+    }
+
+    private static void parseCustomAllocations(String value) {
+        if (value == null || value.isBlank()) return;
+        for (String entry : value.split(",")) {
+            String[] fields = entry.trim().split(":");
+            if (fields.length < 2 || fields.length > 3) throw new IllegalArgumentException(
+                    "Allocation format is processId:resourceId[:count].");
+            int count = fields.length == 3 ? Integer.parseInt(fields[2]) : 1;
+            for (int i = 0; i < count; i++) {
+                if (!controller.getSystemState().allocateResource(fields[0], fields[1])) {
+                    throw new IllegalArgumentException("Allocation cannot be created: " + entry);
+                }
+            }
+        }
+    }
+
+    private static void parseCustomWaiting(String value) {
+        if (value == null || value.isBlank()) return;
+        for (String entry : value.split(",")) {
+            String[] fields = entry.trim().split(":");
+            if (fields.length != 2) throw new IllegalArgumentException(
+                    "Waiting format is processId:resourceId.");
+            if (!controller.getSystemState().setWaitingRequest(fields[0], fields[1])) {
+                throw new IllegalArgumentException("Waiting request cannot be created: " + entry);
+            }
+        }
+    }
+
+    private static RecoveryPlanResult recoverCustom(String recovery) {
+        if ("ONE".equalsIgnoreCase(recovery)) {
+            return controller.recoverOneAtATime().get(0);
+        }
+        if ("ALL".equalsIgnoreCase(recovery)) {
+            return controller.recoverWithStrategy(RecoveryPlan.Strategy.TERMINATE_ALL);
+        }
+        return controller.recoverAdaptive();
+    }
+
+    private static void requireCustomSection(String value, String name) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("Custom scenario requires " + name + ".");
+        }
+    }
+
+    private static int scenarioOption(String[] args, String option, int defaultValue) {
+        return Integer.parseInt(scenarioOption(args, option, String.valueOf(defaultValue)));
+    }
+
+    private static String scenarioOption(String[] args, String option,
+            String defaultValue) {
+        for (int i = 2; i < args.length - 1; i++) {
+            if (option.equalsIgnoreCase(args[i])) return args[i + 1];
+        }
+        return defaultValue;
     }
 
     private static void configureSystem() {
@@ -175,6 +388,10 @@ public class SimulatorCLI {
                     printMetrics();
                     break;
 
+                case "HISTORY":
+                    printHistory();
+                    break;
+
                 case "EXPERIMENT":
                     handleExperiment(parts);
                     break;
@@ -272,6 +489,7 @@ public class SimulatorCLI {
         }
         try {
             int index = Integer.parseInt(parts[1]);
+            evaluatedPlans = controller.evaluateRecoveryPlans();
             if (index < 0 || index >= evaluatedPlans.size()) {
                 throw new IllegalArgumentException("Unknown plan index.");
             }
@@ -321,9 +539,11 @@ public class SimulatorCLI {
         System.out.println("Recoveries: " + metrics.getRecoveryCount());
         System.out.println("Success rate: " + metrics.getSuccessRate());
         System.out.println("Total cost: " + metrics.getTotalCost());
+        System.out.println("Average cost: " + metrics.getAverageCost());
         System.out.println("Terminated processes: "
                 + metrics.getTotalTerminatedProcesses());
         System.out.println("Work lost: " + metrics.getTotalWorkLost());
+        System.out.println("Average work lost: " + metrics.getAverageWorkLost());
         System.out.println("Recovery time (ns): "
                 + metrics.getTotalRecoveryTimeNanos());
         System.out.println("Resource utilization: "
@@ -333,10 +553,30 @@ public class SimulatorCLI {
                 + metrics.getRepeatedVictimSelections());
         System.out.println("Starvation indicator: "
                 + metrics.getStarvationIndicator());
+        System.out.println("Maximum victim count: "
+            + metrics.getMaximumVictimCount());
+        System.out.println("Average victim count: "
+            + metrics.getAverageVictimCount());
         System.out.println("Average absolute prediction error: "
                 + metrics.getAverageAbsoluteCostError());
+        System.out.println("Average signed prediction error: "
+            + metrics.getAverageSignedCostError());
         System.out.println("Average relative prediction error: "
                 + metrics.getAverageRelativeCostError());
+        System.out.println("Cost configuration: "
+            + controller.getRecoveryCostWeights());
+    }
+
+    private static void printHistory() {
+        System.out.println("\n--- RECOVERY HISTORY ---");
+        List<String> events = controller.getEventLogger().getEvents();
+        if (events.isEmpty()) {
+            System.out.println("No recovery history.");
+            return;
+        }
+        for (String event : events) {
+            System.out.println(event);
+        }
     }
 
     private static void handleExperiment(String[] parts) {
@@ -454,6 +694,7 @@ public class SimulatorCLI {
         System.out.println("APPLY <planIndex>");
         System.out.println("RECOVER ADAPTIVE|ONE|ALL|ROLLBACK|PREEMPT");
         System.out.println("METRICS");
+        System.out.println("HISTORY");
         System.out.println("EXPERIMENT <processes> <resources> <iterations> "
             + "[pattern] [instances] [preemptibleEvery]");
         System.out.println("HELP");
@@ -462,6 +703,17 @@ public class SimulatorCLI {
         System.out.println("java -cp out deadlock.SimulatorCLI --batch "
             + "\"2;P1;1;P2;2;2;R1;1;no;R2;1;yes;"
             + "REQUEST P1 R1;EXIT\"");
+        System.out.println("\nOne-command scenarios:");
+        System.out.println("java -cp out deadlock.SimulatorCLI --scenario DEADLOCK");
+        System.out.println("java -cp out deadlock.SimulatorCLI --scenario EXPERIMENT");
+        System.out.println("java -cp out deadlock.SimulatorCLI --scenario DEADLOCK "
+            + "--processes 3 --resources 3 --instances 1 "
+            + "--preemptible R2 --recovery ADAPTIVE");
+        System.out.println("\nCustom scenario:");
+        System.out.println("java -cp out deadlock.SimulatorCLI --custom "
+            + "\"processes=P1:1,P2:2;resources=R1:1:no,R2:1:yes;"
+            + "allocations=P1:R1,P2:R2;waiting=P1:R2,P2:R1;"
+            + "recovery=ADAPTIVE\"");
         System.out.println("\nExample:");
         System.out.println("REQUEST P1 R1");
         System.out.println("REQUEST P2 R1");

@@ -43,6 +43,7 @@ public final class AdaptiveStrategySelector {
     }
 
     public void observe(RecoveryContext context, RecoveryPlanResult result) {
+        if (context == null || result == null || !result.isExecutable()) return;
         EnumMap<RecoveryPlan.Strategy, Statistics> stats = history.computeIfAbsent(
                 context, ignored -> new EnumMap<>(RecoveryPlan.Strategy.class));
         Statistics strategy = stats.computeIfAbsent(result.getPlan().getStrategy(),
@@ -66,6 +67,10 @@ public final class AdaptiveStrategySelector {
 
     public int getKnownContextCount() { return history.size(); }
 
+    public boolean hasHistory(RecoveryContext context) {
+        return history.containsKey(context);
+    }
+
     public void clear() { history.clear(); }
 
     private RecoveryPlanResult selectFallbackResult(List<RecoveryPlanResult> candidates) {
@@ -73,6 +78,8 @@ public final class AdaptiveStrategySelector {
                 .filter(RecoveryPlanResult::isExecutable)
                 .min(java.util.Comparator
                         .comparingDouble(RecoveryPlanResult::getCost)
+                    .thenComparingDouble(RecoveryPlanResult::getWorkLost)
+                    .thenComparingInt(RecoveryPlanResult::getTerminatedProcesses)
                         .thenComparing(result -> result.getPlan().toString()))
                 .orElseThrow(() -> new IllegalArgumentException("No executable recovery plans."));
     }

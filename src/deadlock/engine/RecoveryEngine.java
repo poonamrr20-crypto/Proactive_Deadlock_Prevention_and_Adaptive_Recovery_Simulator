@@ -13,29 +13,51 @@ public class RecoveryEngine {
     private final SystemState systemState;
     private final WaitForGraph waitForGraph;
     private final EventLogger eventLogger;
+    private final RecoveryCostWeights weights;
 
     public RecoveryEngine(SystemState systemState, WaitForGraph waitForGraph,
             EventLogger eventLogger) {
+        this(systemState, waitForGraph, eventLogger, new RecoveryCostWeights());
+    }
+
+    public RecoveryEngine(SystemState systemState, WaitForGraph waitForGraph,
+            EventLogger eventLogger, RecoveryCostWeights weights) {
         if (systemState == null || waitForGraph == null || eventLogger == null) {
             throw new IllegalArgumentException("Recovery dependencies cannot be null.");
+        }
+        if (weights == null) {
+            throw new IllegalArgumentException("Recovery cost weights cannot be null.");
         }
         this.systemState = systemState;
         this.waitForGraph = waitForGraph;
         this.eventLogger = eventLogger;
+        this.weights = weights;
     }
 
-    /** Lower cost is preferred: 4*priority + 3*lost work + 2*held - 5*benefit. */
+    /** Returns the normalized simulated decision cost for terminating a process. */
     public double calculateRecoveryCost(String processId) {
         Process process = systemState.getProcess(processId);
         if (process == null) {
             throw new IllegalArgumentException("Unknown process: " + processId);
         }
-        double lostWork = 100.0 - process.getExecutionProgress();
-        double benefit = countUnblockedProcesses(processId) * 10.0;
-        return 4.0 * process.getPriority()
-                + 3.0 * lostWork
-                + 2.0 * systemState.getTotalAllocatedCount(processId)
-                - 5.0 * benefit;
+        double lostWork = process.getTotalWork() == 0.0 ? 0.0
+            : process.getCompletedWork() / process.getTotalWork();
+        double priorityImpact = lostWork
+            * weights.getPriorityMultiplier(process.getPriority())
+            / weights.getMaximumPriorityMultiplier();
+        double totalResources = 0.0;
+        for (deadlock.model.Resource resource : systemState.getAllResources()) {
+            totalResources += resource.getTotalInstances();
+        }
+        double benefit = totalResources == 0.0 ? 0.0
+            : systemState.getTotalAllocatedCount(processId) / totalResources;
+        double starvation = Math.min(1.0, (double) process.getRecoveryVictimCount()
+            / weights.getStarvationThreshold());
+        return weights.getLostWork() * lostWork
+            + weights.getPriority() * priorityImpact
+            + weights.getTerminationPenalty()
+            + weights.getStarvationRisk() * starvation
+            - weights.getResourceBenefit() * benefit;
     }
 
     public String selectVictim(Collection<String> candidates) {
@@ -43,7 +65,9 @@ public class RecoveryEngine {
             throw new IllegalArgumentException("Recovery candidates cannot be empty.");
         }
         return candidates.stream()
-                .filter(id -> systemState.getProcess(id) != null)
+            .filter(id -> systemState.getProcess(id) != null
+                && systemState.getProcess(id).getState()
+                    != Process.State.TERMINATED)
                 .min(Comparator.comparingDouble(this::calculateRecoveryCost)
                         .thenComparing(id -> id))
                 .orElseThrow(() -> new IllegalArgumentException("No valid recovery candidates."));

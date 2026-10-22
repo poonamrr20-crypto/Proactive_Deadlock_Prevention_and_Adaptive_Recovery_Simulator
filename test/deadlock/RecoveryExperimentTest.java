@@ -35,7 +35,7 @@ public class RecoveryExperimentTest {
                 || report.getMetrics().getStarvationIndicator() < 0.0
                 || report.getMetrics().getAverageAbsoluteCostError() < 0.0
                 || report.getMetrics().getAverageRelativeCostError() < 0.0) {
-            throw new AssertionError("Experiment metrics were incomplete.");
+                throw new AssertionError("Multi-instance experiment metrics were incomplete.");
             }
         }
         System.out.println("Recovery experiment test passed.");

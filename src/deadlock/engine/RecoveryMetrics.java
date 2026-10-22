@@ -62,10 +62,18 @@ public final class RecoveryMetrics {
         return total;
     }
 
+    public double getAverageCost() {
+        return outcomes.isEmpty() ? 0.0 : getTotalCost() / outcomes.size();
+    }
+
     public double getTotalWorkLost() {
         double total = 0.0;
         for (Outcome outcome : outcomes) total += outcome.result.getWorkLost();
         return total;
+    }
+
+    public double getAverageWorkLost() {
+        return outcomes.isEmpty() ? 0.0 : getTotalWorkLost() / outcomes.size();
     }
 
     public int getTotalTerminatedProcesses() {
@@ -121,6 +129,17 @@ public final class RecoveryMetrics {
         return repeated;
     }
 
+    public int getMaximumVictimCount() {
+        return victimSelections.isEmpty() ? 0 : Collections.max(victimSelections.values());
+    }
+
+    public double getAverageVictimCount() {
+        if (victimSelections.isEmpty()) return 0.0;
+        int total = 0;
+        for (int count : victimSelections.values()) total += count;
+        return (double) total / victimSelections.size();
+    }
+
     /** Higher values indicate concentration of recovery on a repeated victim. */
     public double getStarvationIndicator() {
         if (victimSelections.isEmpty()) return 0.0;
@@ -134,6 +153,18 @@ public final class RecoveryMetrics {
         for (Outcome outcome : outcomes) {
             if (outcome.comparison != null) {
                 total += outcome.comparison.getAbsoluteCostError();
+                count++;
+            }
+        }
+        return count == 0 ? 0.0 : total / count;
+    }
+
+    public double getAverageSignedCostError() {
+        double total = 0.0;
+        int count = 0;
+        for (Outcome outcome : outcomes) {
+            if (outcome.comparison != null) {
+                total += outcome.comparison.getSignedCostError();
                 count++;
             }
         }

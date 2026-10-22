@@ -120,25 +120,21 @@ if (systemState.getAllocatedCount(processId, resourceId)
     );
 }
 
-        // Proposed resource-order edges from resources
-        // already held by this process to the requested resource.
-        Map<String, Map<String, Integer>> allocations =
-                systemState.getAllocations();
+        java.util.List<String[]> addedEdges = new java.util.ArrayList<>();
+        if (!systemState.hasMultiInstanceResource()) {
+            Map<String, Map<String, Integer>> allocations =
+                    systemState.getAllocations();
+            Map<String, Integer> held = allocations.get(processId);
 
-        Map<String, Integer> held = allocations.get(processId);
+            if (held == null) {
+                return new RequestResult(
+                    RequestStatus.DENIED,
+                    "Process allocation record is missing."
+                );
+            }
 
-        if (held == null) {
-            return new RequestResult(
-                RequestStatus.DENIED,
-                "Process allocation record is missing."
-            );
-        }
-
-        // Check proposed edges before permanently adding them.
-        
-java.util.List<String[]> addedEdges = new java.util.ArrayList<>();
-
-for (Map.Entry<String, Integer> entry : held.entrySet()) {
+            // Lock-order prevention is valid only for single-instance resources.
+            for (Map.Entry<String, Integer> entry : held.entrySet()) {
     if (entry.getValue() <= 0) {
         continue;
     }
@@ -176,7 +172,8 @@ for (Map.Entry<String, Integer> entry : held.entrySet()) {
             "Request denied: Lock-order Graph cycle detected."
         );
     }
-}
+            }
+        }
 
 
         // If no instance is available, record the waiting request.
@@ -264,6 +261,11 @@ private void rebuildWaitForGraph() {
             continue;
         }
 
+        Resource requested = systemState.getResource(requestedResource);
+        if (requested == null || requested.hasAvailableInstance()) {
+            continue;
+        }
+
         for (Process holder : systemState.getAllProcesses()) {
             if (!holder.getProcessId().equals(
                     waitingProcess.getProcessId())
@@ -297,6 +299,8 @@ public void releaseResource(
     if (!released) {
         return;
     }
+
+    lockOrderGraph.clear();
 
     // Reconsider processes waiting for the released resource.
     for (Process process : systemState.getAllProcesses()) {

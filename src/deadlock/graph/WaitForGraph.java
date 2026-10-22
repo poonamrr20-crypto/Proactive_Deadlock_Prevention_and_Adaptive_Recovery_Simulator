@@ -111,7 +111,7 @@ public void clear() {
 
     public Set<String> getCycleNodes() {
         Set<String> visited = new LinkedHashSet<>();
-        Set<String> path = new LinkedHashSet<>();
+        List<String> path = new ArrayList<>();
         for (String processId : adjacencyList.keySet()) {
             Set<String> cycle = findCycle(processId, visited, path);
             if (!cycle.isEmpty()) {
@@ -122,9 +122,10 @@ public void clear() {
     }
 
     private Set<String> findCycle(String current, Set<String> visited,
-            Set<String> path) {
-        if (path.contains(current)) {
-            return new LinkedHashSet<>(path);
+            List<String> path) {
+        int cycleStart = path.indexOf(current);
+        if (cycleStart >= 0) {
+            return new LinkedHashSet<>(path.subList(cycleStart, path.size()));
         }
         if (visited.contains(current)) {
             return Collections.emptySet();
@@ -137,7 +138,7 @@ public void clear() {
                 return cycle;
             }
         }
-        path.remove(current);
+        path.remove(path.size() - 1);
         return Collections.emptySet();
     }
 

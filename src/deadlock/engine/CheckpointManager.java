@@ -5,6 +5,8 @@ import deadlock.model.SystemState;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Collections;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /** Stores process snapshots that can be used by rollback actions. */
@@ -15,6 +17,9 @@ public final class CheckpointManager {
         Process process = state.getProcess(processId);
         if (process == null) {
             throw new IllegalArgumentException("Unknown process: " + processId);
+        }
+        if (process.getState() == Process.State.TERMINATED) {
+            throw new IllegalArgumentException("Cannot checkpoint a terminated process.");
         }
         if (checkpointId == null || checkpointId.isBlank()) {
             throw new IllegalArgumentException("Checkpoint ID cannot be empty.");
@@ -28,6 +33,13 @@ public final class CheckpointManager {
     public boolean has(String processId, String checkpointId) {
         return checkpoints.containsKey(processId)
                 && checkpoints.get(processId).containsKey(checkpointId);
+    }
+
+    public Set<String> getCheckpointIds(String processId) {
+        Map<String, Checkpoint> processCheckpoints = checkpoints.get(processId);
+        if (processCheckpoints == null) return Collections.emptySet();
+        return Collections.unmodifiableSet(
+                new java.util.LinkedHashSet<>(processCheckpoints.keySet()));
     }
 
     public double getProgress(String processId, String checkpointId) {
@@ -51,6 +63,11 @@ public final class CheckpointManager {
                 || process.getState() == Process.State.TERMINATED) {
             return false;
         }
+        if (checkpoint.state == Process.State.TERMINATED
+                || (checkpoint.state == Process.State.WAITING)
+                    != (checkpoint.waitingResource != null)) {
+            return false;
+        }
         if (checkpoint.waitingResource != null
                 && state.getResource(checkpoint.waitingResource) == null) {
             return false;
@@ -69,15 +86,16 @@ public final class CheckpointManager {
         for (Map.Entry<String, Integer> entry : checkpoint.heldResources.entrySet()) {
             for (int i = 0; i < entry.getValue(); i++) {
                 if (!state.allocateResource(processId, entry.getKey())) {
-                    return false;
+                    throw new IllegalStateException(
+                            "Checkpoint validation changed during restoration.");
                 }
             }
         }
         process.setExecutionProgress(checkpoint.executionProgress);
-        if (checkpoint.waitingResource != null) {
-            if (!state.setWaitingRequest(processId, checkpoint.waitingResource)) {
-                return false;
-            }
+        state.clearWaitingRequest(processId);
+        if (checkpoint.waitingResource != null
+                && !state.setWaitingRequest(processId, checkpoint.waitingResource)) {
+            throw new IllegalStateException("Checkpoint waiting request cannot be restored.");
         }
         process.setState(checkpoint.state);
         return true;

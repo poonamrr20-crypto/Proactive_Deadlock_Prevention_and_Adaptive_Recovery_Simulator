@@ -13,7 +13,6 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 public class SimulationController {
-    private static final int MAX_COMBINED_PLANS = 4096;
     private final SystemState systemState;
     private final WaitForGraph waitForGraph;
     private final LockOrderGraph lockOrderGraph;
@@ -27,24 +26,26 @@ public class SimulationController {
     private final AdaptiveStrategySelector adaptiveSelector;
     private final RecoveryMetrics recoveryMetrics;
     private final List<RecoveryCostComparison> recoveryComparisons;
+    private long deadlockSequence;
 
     public SimulationController() {
         systemState = new SystemState();
         waitForGraph = new WaitForGraph();
         lockOrderGraph = new LockOrderGraph();
         eventLogger = new EventLogger();
+        recoveryCostWeights = new RecoveryCostWeights();
         preventionEngine = new PreventionEngine(systemState, waitForGraph,
                 lockOrderGraph);
         recoveryEngine = new RecoveryEngine(systemState, waitForGraph,
-                eventLogger);
+            eventLogger, recoveryCostWeights);
         checkpointManager = new CheckpointManager();
-        recoveryCostWeights = new RecoveryCostWeights();
         victimCounts = new LinkedHashMap<>();
         planEvaluator = new RecoveryPlanEvaluator(checkpointManager,
             recoveryCostWeights, victimCounts);
         adaptiveSelector = new AdaptiveStrategySelector();
         recoveryMetrics = new RecoveryMetrics();
         recoveryComparisons = new ArrayList<>();
+        deadlockSequence = 0L;
     }
 
     public void addProcess(Process process) {
@@ -79,18 +80,25 @@ public class SimulationController {
     }
 
     public boolean hasDeadlock() {
+        preventionEngine.refreshWaitForGraph();
         return waitForGraph.hasCycle();
     }
 
     public List<String> detectDeadlock() {
+        preventionEngine.refreshWaitForGraph();
         List<String> cycle = new ArrayList<>(waitForGraph.getCycleNodes());
         if (!cycle.isEmpty()) {
-            eventLogger.record("DEADLOCK cycle=" + cycle);
+            deadlockSequence++;
+            eventLogger.record("DEADLOCK id=" + deadlockSequence
+                    + " cycle=" + cycle);
         }
         return Collections.unmodifiableList(cycle);
     }
 
     public RecoveryEngine.RecoveryResult recoverDeadlock() {
+        if (!hasDeadlock()) {
+            throw new IllegalStateException("No deadlock detected.");
+        }
         String victim = recoveryEngine.selectVictim();
         RecoveryEngine.RecoveryResult result = recoveryEngine.recover(victim);
         resumeWaitingProcesses();
@@ -129,8 +137,9 @@ public class SimulationController {
 
     /** Generates executable candidates without changing the live state. */
     public List<RecoveryPlan> generateRecoveryPlans() {
+        preventionEngine.refreshWaitForGraph();
         List<String> candidates = new ArrayList<>(waitForGraph.getCycleNodes());
-        if (candidates.isEmpty()) candidates.addAll(waitForGraph.getProcesses());
+        if (candidates.isEmpty()) return Collections.emptyList();
         List<RecoveryPlan> plans = new ArrayList<>();
         List<List<RecoveryAction>> actionsByProcess = new ArrayList<>();
         for (String processId : candidates) {
@@ -139,8 +148,8 @@ public class SimulationController {
             processActions.add(termination);
             plans.add(new RecoveryPlan(RecoveryPlan.Strategy.SINGLE_TERMINATION,
                     Collections.singletonList(termination)));
-            if (checkpointManager.has(processId, "default")) {
-                RecoveryAction rollback = RecoveryAction.rollback(processId);
+            for (String checkpointId : checkpointManager.getCheckpointIds(processId)) {
+                RecoveryAction rollback = RecoveryAction.rollback(processId, checkpointId);
                 processActions.add(rollback);
                 plans.add(new RecoveryPlan(RecoveryPlan.Strategy.ROLLBACK,
                         Collections.singletonList(rollback)));
@@ -174,12 +183,14 @@ public class SimulationController {
 
     private void addCombinedPlans(List<List<RecoveryAction>> actionsByProcess,
             int index, List<RecoveryAction> selected, List<RecoveryPlan> plans) {
-        if (plans.size() >= MAX_COMBINED_PLANS) return;
+        if (plans.size() >= recoveryCostWeights.getCombinationLimit()) return;
         if (index == actionsByProcess.size()) {
             if (selected.size() < 2 || isTerminateAll(selected, actionsByProcess.size())) {
                 return;
             }
-            plans.add(new RecoveryPlan(RecoveryPlan.Strategy.COMBINED, selected));
+            if (hasDistinctProcesses(selected)) {
+                plans.add(new RecoveryPlan(RecoveryPlan.Strategy.COMBINED, selected));
+            }
             return;
         }
         addCombinedPlans(actionsByProcess, index + 1, selected, plans);
@@ -198,16 +209,32 @@ public class SimulationController {
         return true;
     }
 
+    private boolean hasDistinctProcesses(List<RecoveryAction> actions) {
+        java.util.Set<String> processIds = new java.util.HashSet<>();
+        for (RecoveryAction action : actions) {
+            if (!processIds.add(action.getProcessId())) return false;
+        }
+        return true;
+    }
+
     public List<RecoveryPlanResult> evaluateRecoveryPlans() {
         List<RecoveryPlanResult> results = new ArrayList<>();
         for (RecoveryPlan plan : generateRecoveryPlans()) {
-            results.add(planEvaluator.evaluate(plan, systemState));
+            RecoveryPlanResult result = planEvaluator.evaluate(plan, systemState);
+            results.add(result);
+            eventLogger.record("PLAN_CANDIDATE plan=" + plan
+                    + " valid=" + result.isExecutable()
+                    + " resolved=" + result.isDeadlockResolved()
+                    + " predictedCost=" + result.getCost()
+                    + " message=" + result.getMessage());
         }
         return Collections.unmodifiableList(results);
     }
 
     public RecoveryPlanResult recoverPlan(RecoveryPlan plan) {
         RecoveryContext context = recoveryContext();
+        long recoveryDeadlockId = deadlockSequence == 0 ? ++deadlockSequence
+            : deadlockSequence;
         RecoveryPlanResult predicted = planEvaluator.evaluate(plan, systemState);
         if (!predicted.isExecutable()) {
             throw new IllegalArgumentException(predicted.getMessage());
@@ -220,26 +247,44 @@ public class SimulationController {
         recoveryComparisons.add(comparison);
         recoveryMetrics.record(predicted, actual, System.nanoTime() - started);
         for (deadlock.engine.RecoveryAction action : plan.getActions()) {
-            if (action.getType() == deadlock.engine.RecoveryAction.Type.TERMINATE) {
+            if (action.getType() == deadlock.engine.RecoveryAction.Type.TERMINATE
+                    || action.getType() == deadlock.engine.RecoveryAction.Type.PREEMPT
+                    || action.getType() == deadlock.engine.RecoveryAction.Type.ROLLBACK) {
                 recoveryMetrics.recordVictimSelection(action.getProcessId());
             }
         }
         adaptiveSelector.observe(context, actual);
-        eventLogger.record("RECOVERY_PLAN plan=" + plan
+        eventLogger.record("RECOVERY_CONTEXT id=" + recoveryDeadlockId
+            + " " + context);
+        eventLogger.record("RECOVERY_PLAN id=" + recoveryDeadlockId
+            + " plan=" + plan
                 + " predictedCost=" + predicted.getCost()
-                + " actualCost=" + actual.getCost());
+            + " actualCost=" + actual.getCost()
+            + " resolved=" + actual.isDeadlockResolved()
+            + " workLost=" + actual.getWorkLost()
+            + " predictionError="
+            + new RecoveryCostComparison(predicted, actual).getSignedCostError());
         return actual;
     }
 
     public RecoveryPlanResult recoverAdaptive() {
         List<RecoveryPlanResult> evaluated = evaluateRecoveryPlans();
         RecoveryPlan selected;
+        RecoveryContext context = recoveryContext();
+        boolean hasHistory = adaptiveSelector.hasHistory(context);
         try {
-            selected = adaptiveSelector.select(recoveryContext(), evaluated);
+            selected = adaptiveSelector.select(context, evaluated);
+            eventLogger.record((hasHistory ? "ADAPTIVE_SELECTION" : "FALLBACK_SELECTION")
+                    + " strategy=" + selected.getStrategy());
         } catch (RuntimeException adaptiveFailure) {
-            selected = adaptiveSelector.selectFallback(evaluated);
             eventLogger.record("ADAPTIVE_FALLBACK reason="
                     + adaptiveFailure.getMessage());
+            try {
+                selected = adaptiveSelector.selectFallback(evaluated);
+            } catch (RuntimeException noPlan) {
+                throw new IllegalStateException(
+                        "UNRECOVERABLE DEADLOCK: no valid recovery plan.", noPlan);
+            }
         }
         return recoverPlan(selected);
     }
@@ -262,13 +307,15 @@ public class SimulationController {
                             && result.getPlan().getStrategy()
                             == RecoveryPlan.Strategy.SINGLE_TERMINATION)
                     .min(java.util.Comparator.comparingDouble(RecoveryPlanResult::getCost))
-                    .orElseThrow(() -> new IllegalStateException("No single-victim plan."));
+                        .orElseThrow(() -> new IllegalStateException(
+                            "UNRECOVERABLE DEADLOCK: no valid single-victim plan."));
             results.add(recoverPlan(selected.getPlan()));
         }
         return Collections.unmodifiableList(results);
     }
 
     private RecoveryContext recoveryContext() {
+        preventionEngine.refreshWaitForGraph();
         return RecoveryContext.from(systemState, waitForGraph);
     }
 
@@ -278,6 +325,7 @@ public class SimulationController {
         lockOrderGraph.clear();
         eventLogger.clear();
         victimCounts.clear();
+        deadlockSequence = 0L;
         checkpointManager.clear();
         recoveryMetrics.clear();
         recoveryComparisons.clear();
